@@ -14,6 +14,7 @@ from google.api_core.exceptions import ResourceExhausted, NotFound, PermissionDe
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+from datetime import datetime, timezone
 
 # ---------- Load Environment Variables ----------
 load_dotenv()
@@ -243,34 +244,165 @@ def suggest_coping_strategy(entry: str, emotions: str, repeated_emotion: str = N
     conversation_history.append(f"User: {entry}\nAssistant: {cleaned}")
     return cleaned
 
-# ---------- Agentic Video Tool ----------
-VIDEO_QUERY_PATTERNS = [
-    (r"\b(breath|breathe|breathing|panic|anxiety)\b", "5 minute guided breathing for anxiety"),
-    (r"\b(grounding|5-4-3-2-1)\b", "5-4-3-2-1 grounding exercise guided"),
-    (r"\b(mindful|mindfulness|meditat)\b", "10 minute guided mindfulness meditation for stress"),
-    (r"\b(progressive muscle|pmr|tense and release)\b", "progressive muscle relaxation guided"),
-    (r"\b(sleep|insomnia|can't sleep|cant sleep)\b", "sleep relaxation body scan 10 minutes"),
-    (r"\b(journal|journaling)\b", "guided journaling for anxiety prompt"),
-    (r"\b(cbt|cognitive|thought record|reframe)\b", "CBT thought record tutorial step by step"),
-    (r"\b(worry|overthink|rumination)\b", "cognitive defusion exercise guided"),
-    (r"\b(study|exam|test|focus|concentrat)\b", "pomodoro timer study with me 25 minute"),
-    (r"\b(work|burnout|break|office|deadline)\b", "2 minute desk breathing box breathing"),
+# ---------- Agentic Video Tool (Expanded) ----------
+# In-memory cache to reduce API churn when suggesting more often
+_YT_CACHE = {}  # key -> (ts, results list)
+_YT_TTL_SEC = 6 * 3600
+
+def _cache_get(key):
+    if key in _YT_CACHE:
+        ts, val = _YT_CACHE[key]
+        if (time.time() - ts) < _YT_TTL_SEC:
+            return val
+        else:
+            _YT_CACHE.pop(key, None)
+    return None
+
+def _cache_set(key, val):
+    _YT_CACHE[key] = (time.time(), val)
+
+PRIMARY_PATTERNS = [
+    # Strong, high-precision triggers
+    (r"\b(breath|breathe|breathing|box breathing|4[- ]?7[- ]?8)\b", [
+        "5 minute guided breathing for anxiety",
+        "box breathing 4 4 4 4 guided",
+        "4-7-8 breathing guided 3 minutes"
+    ]),
+    (r"\b(grounding|5[- ]?4[- ]?3[- ]?2[- ]?1)\b", [
+        "5-4-3-2-1 grounding exercise guided",
+        "anxiety grounding practice quick"
+    ]),
+    (r"\b(mindful|mindfulness|meditat(ion|e)?)\b", [
+        "10 minute guided mindfulness meditation for stress",
+        "short body scan meditation anxiety"
+    ]),
+    (r"\b(progressive muscle|pmr|tense and release)\b", [
+        "progressive muscle relaxation guided",
+        "pmr full body 10 minutes"
+    ]),
+    (r"\b(sleep|insomnia|cant sleep|can't sleep)\b", [
+        "sleep relaxation body scan 10 minutes",
+        "fall asleep meditation 10 minutes"
+    ]),
+    (r"\b(journal|journaling|thought record|reframe|cbt|cognitive)\b", [
+        "CBT thought record tutorial step by step",
+        "guided journaling prompts anxiety"
+    ]),
+    (r"\b(overthink|worry|rumination|spiral)\b", [
+        "cognitive defusion exercise guided",
+        "mindfulness for overthinking 10 minutes"
+    ]),
+    (r"\b(study|exam|test|focus|concentrat|revision|procrastinat(e|ion))\b", [
+        "pomodoro timer study with me 25 minute",
+        "focus timer 25 5 study with me"
+    ]),
+    (r"\b(work|burnout|break|office|deadline|meeting)\b", [
+        "2 minute desk breathing box breathing",
+        "desk stretch break 5 minutes"
+    ]),
+    (r"\b(panic attack|panic)\b", [
+        "panic attack help breathing now",
+        "grounding for panic 5 minutes"
+    ]),
+    (r"\b(anger|irritab(le|ility))\b", [
+        "progressive muscle relaxation anger",
+        "box breathing for anger quick"
+    ]),
+    (r"\b(sad|lonely|down|depress(ed)?)\b", [
+        "self compassion meditation 10 minutes",
+        "guided imagery relaxation calm"
+    ]),
+    (r"\b(stretch|yoga)\b", [
+        "yoga for anxiety 10 minutes",
+        "desk stretch routine 5 minutes"
+    ]),
 ]
 
-def _first_match(text: str, patterns):
-    t = (text or "").lower()
-    for pat, query in patterns:
-        if re.search(pat, t):
-            return query
-    return None
+# Secondary, more general topics used if primary didn’t hit or returned no good videos
+SECONDARY_TOPICS = [
+    "short guided breathing exercise",
+    "quick grounding exercise for anxiety",
+    "mindfulness for stress beginners",
+    "guided imagery relaxation stress relief",
+    "EFT tapping for anxiety beginner",
+    "self compassion meditation short",
+    "sleep body scan 10 minutes",
+    "study pomodoro 25 minute focus",
+    "time management prioritization tutorial short"
+]
+
+def _extract_keywords(s):
+    s = (s or "").lower()
+    found = set()
+    for pat, _ in PRIMARY_PATTERNS:
+        if re.search(pat, s):
+            found.add(pat)
+    return found
+
+def _build_video_queries(user_text: str, strategy_text: str, emotions: list):
+    """
+    Create a prioritized list of search queries based on:
+    - exact keyword matches in user input / strategy
+    - emotion signals
+    - secondary general topics
+    """
+    queries = []
+    used = set()
+
+    # 1) Primary pattern hits from user_text
+    for pat, qlist in PRIMARY_PATTERNS:
+        if re.search(pat, (user_text or "").lower()):
+            for q in qlist:
+                if q not in used:
+                    used.add(q); queries.append(q)
+
+    # 2) Primary pattern hits from strategy_text
+    for pat, qlist in PRIMARY_PATTERNS:
+        if re.search(pat, (strategy_text or "").lower()):
+            for q in qlist:
+                if q not in used:
+                    used.add(q); queries.append(q)
+
+    # 3) Emotion-informed expansions
+    emos = [e.lower() for e in (emotions or [])]
+    if any(e in ("anxiety", "fear", "surprise") for e in emos):
+        for q in ["box breathing 4 4 4 4 guided", "5-4-3-2-1 grounding exercise guided", "EFT tapping for anxiety beginner"]:
+            if q not in used: used.add(q); queries.append(q)
+    if any(e in ("sadness",) for e in emos):
+        for q in ["self compassion meditation 10 minutes", "guided imagery relaxation calm"]:
+            if q not in used: used.add(q); queries.append(q)
+    if any(e in ("anger",) for e in emos):
+        for q in ["box breathing for anger quick", "progressive muscle relaxation anger"]:
+            if q not in used: used.add(q); queries.append(q)
+
+    # 4) Secondary general topics (broad fallback)
+    for q in SECONDARY_TOPICS:
+        if q not in used:
+            used.add(q); queries.append(q)
+
+    return queries
 
 def _clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
-def _yt_search(query: str, max_results: int = 5):
-    """YouTube Data API v3: search + get durations. Returns list of dicts. Safe no-op if no API key."""
+def _parse_iso8601_duration(d):
+    # PT#H#M#S, PT#M#S, PT#S
+    hours = minutes = seconds = 0
+    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", d or "")
+    if m:
+        hours = int(m.group(1) or 0)
+        minutes = int(m.group(2) or 0)
+        seconds = int(m.group(3) or 0)
+    return hours * 3600 + minutes * 60 + seconds
+
+def _yt_search(query: str, max_results: int = 8):
+    """YouTube Data API v3: search + get durations/recency/metrics. Cached. Safe no-op if no API key."""
     if not YOUTUBE_API_KEY:
         return []
+    cache_key = f"yt:{query}:{max_results}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         # 1) search
         search_r = requests.get(
@@ -289,15 +421,16 @@ def _yt_search(query: str, max_results: int = 5):
         search_r.raise_for_status()
         items = search_r.json().get("items", [])
         if not items:
+            _cache_set(cache_key, [])
             return []
 
         video_ids = ",".join([it["id"]["videoId"] for it in items])
 
-        # 2) fetch durations/metrics
+        # 2) fetch durations/metrics/recency
         vid_r = requests.get(
             "https://www.googleapis.com/youtube/v3/videos",
             params={
-                "part": "contentDetails,statistics",
+                "part": "contentDetails,statistics,snippet",
                 "id": video_ids,
                 "key": YOUTUBE_API_KEY
             },
@@ -306,88 +439,115 @@ def _yt_search(query: str, max_results: int = 5):
         vid_r.raise_for_status()
         meta_by_id = {it["id"]: it for it in vid_r.json().get("items", [])}
 
-        def parse_iso8601_duration(d):
-            # PT#H#M#S, PT#M#S, PT#S
-            hours = minutes = seconds = 0
-            m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", d or "")
-            if m:
-                hours = int(m.group(1) or 0)
-                minutes = int(m.group(2) or 0)
-                seconds = int(m.group(3) or 0)
-            return hours * 3600 + minutes * 60 + seconds
-
         results = []
         for it in items:
             vid = it["id"]["videoId"]
             snip = it["snippet"]
             meta = meta_by_id.get(vid, {})
             dur_iso = (meta.get("contentDetails") or {}).get("duration", "PT0S")
-            dur_sec = parse_iso8601_duration(dur_iso)
-            views = int((meta.get("statistics") or {}).get("viewCount", 0))
+            dur_sec = _parse_iso8601_duration(dur_iso)
+            stats = meta.get("statistics") or {}
+            views = int(stats.get("viewCount", 0))
+            published_at = ((meta.get("snippet") or {}).get("publishedAt")) or (snip.get("publishedAt"))
+            # compute age in days (lower is newer)
+            age_days = 99999
+            if published_at:
+                try:
+                    dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                    age_days = max(0, (datetime.now(timezone.utc) - dt).days)
+                except Exception:
+                    pass
             results.append({
                 "video_id": vid,
                 "title": _clean_text(snip.get("title", "")),
                 "channel": snip.get("channelTitle", ""),
                 "duration_sec": dur_sec,
                 "views": views,
+                "age_days": age_days,
                 "url": f"https://www.youtube.com/watch?v={vid}",
             })
+        _cache_set(cache_key, results)
         return results
     except Exception:
+        _cache_set(cache_key, [])
         return []
 
 def _rank_videos(videos, target_min=180, target_max=1200):
-    """Prefer short-to-medium, higher views."""
+    """
+    Prefer short-to-medium, higher views, and newer uploads.
+    Duration band target: 3–20 min; wider acceptance handled by final gate.
+    """
     def score(v):
         dur = v.get("duration_sec", 0) or 0
+        views = v.get("views", 0) or 0
+        age = v.get("age_days", 99999)
+        # duration preference
         in_band = target_min <= dur <= target_max
         mid = (target_min + target_max) / 2
-        length_penalty = abs(dur - mid)
-        return (1000000 if in_band else 0) + v.get("views", 0) - length_penalty
+        length_penalty = abs(dur - mid) / 10.0  # scale penalty
+        # recency bonus (newer is slightly better; cap at ~5 years)
+        recency_bonus = max(0, (2000 - min(age, 2000)))  # 0..2000
+        return (2000000 if in_band else 0) + views + recency_bonus - length_penalty
     return sorted(videos, key=score, reverse=True)
 
-def maybe_recommend_video(user_text: str, strategy_text: str):
+def maybe_recommend_video(user_text: str, strategy_text: str, emotions: list):
     """
     Decide whether to fetch a video.
-    - Trigger if user_text or strategy mentions a known activity.
+    - Build multiple candidate queries (patterns + emotions + fallbacks).
+    - Try them in order until a good result is found.
     - Return dict with video info OR None.
     """
-    query = _first_match(user_text, VIDEO_QUERY_PATTERNS) or _first_match(strategy_text, VIDEO_QUERY_PATTERNS)
-    if not query:
+    queries = _build_video_queries(user_text, strategy_text, emotions)
+    if not queries:
         return None
 
-    candidates = _yt_search(query, max_results=6)
-    if not candidates:
+    best = None
+    for q in queries[:8]:  # cap number of lookups per message
+        candidates = _yt_search(q, max_results=8)
+        if not candidates:
+            continue
+        ranked = _rank_videos(candidates)
+        top = ranked[0]
+        # final gate: allow 45s to 60m, prefer shorter but permit long if very high quality
+        if 45 <= top["duration_sec"] <= 3600:
+            best = top
+            break
+        # if outside band, keep the best seen so far in case nothing else qualifies
+        if best is None or (top.get("views", 0) > best.get("views", 0)):
+            best = top
+
+    if not best:
         return None
 
-    ranked = _rank_videos(candidates)
-    top = ranked[0]
-
-    # final gate: avoid too short (<60s) or too long (>40m)
-    if top["duration_sec"] < 60 or top["duration_sec"] > 2400:
-        return None
-
-    # consumption guidance tailored to the query
+    # consumption guidance tailored to the chosen query (best-effort)
     guide = "Play the video in a quiet spot. Follow along in real time and pause if needed."
-    q = query.lower()
-    if "breath" in q or "box" in q:
+    q_all = " ".join(queries).lower()
+    if ("breath" in q_all) or ("box" in q_all) or ("4-7-8" in q_all):
         guide = "Sit upright, shoulders relaxed. Inhale 4, hold 4, exhale 4 (or as guided). Follow the instructor’s pacing."
-    elif "grounding" in q:
+    elif "grounding" in q_all:
         guide = "Follow 5-4-3-2-1: name 5 things you see, 4 touch, 3 hear, 2 smell, 1 taste. Let the guide pace you."
-    elif "mindful" in q or "meditation" in q or "body scan" in q:
+    elif ("mindful" in q_all) or ("meditation" in q_all) or ("body scan" in q_all):
         guide = "Keep eyes soft or closed. If your mind wanders, gently return to the breath/body without judgment."
-    elif "progressive muscle" in q:
+    elif "progressive muscle" in q_all or "pmr" in q_all:
         guide = "Follow ‘tense then release’ instructions. Don’t strain; aim for gentle tension and full release."
-    elif "cbt" in q or "thought record" in q:
+    elif "cbt" in q_all or "thought record" in q_all or "journaling" in q_all:
         guide = "Keep a notebook ready. Pause to write each step: situation, thoughts, evidence for/against, reframe."
-    elif "study" in q or "pomodoro" in q:
+    elif "pomodoro" in q_all or "study with me" in q_all or "focus" in q_all:
         guide = "Use the video as a 25-minute focus block. Before starting, list 1–2 concrete tasks to finish."
+    elif "panic" in q_all:
+        guide = "Follow the breathing or grounding steps at your pace. If you feel dizzy, pause and resume when ready."
+    elif "self compassion" in q_all:
+        guide = "Approach yourself kindly. If critical thoughts pop up, notice them and return to the guide’s words."
+    elif "tapping" in q_all:
+        guide = "Follow along with tapping points gently. You can pause after each step if you need more time."
+    elif "yoga" in q_all or "stretch" in q_all:
+        guide = "Clear a small space; move within your comfortable range. Stop if anything hurts."
 
     return {
-        "title": top["title"],
-        "url": top["url"],
-        "channel": top["channel"],
-        "duration_sec": top["duration_sec"],
+        "title": best["title"],
+        "url": best["url"],
+        "channel": best["channel"],
+        "duration_sec": best["duration_sec"],
         "how_to_consume": guide
     }
 
@@ -427,8 +587,8 @@ def analyze_journal_entry(entry_text: str, user_id: str = "default_user"):
 
     strategy = suggest_coping_strategy(entry_text, emotions_str, repeated_emotion)
 
-    # Agentic step: optionally attach a video recommendation
-    video = maybe_recommend_video(entry_text, strategy)
+    # Agentic step: optionally attach a video recommendation (now broader/more frequent)
+    video = maybe_recommend_video(entry_text, strategy, emotions)
 
     metadata = {
         "user": user_id,
