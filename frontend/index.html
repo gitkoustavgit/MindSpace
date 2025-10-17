@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MindSpace • Gentle Support</title>
+  <!-- Bootstrap 5 -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <!-- Bootstrap Icons -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet" />
+  <style>
+    :root{
+      --ms-bg: linear-gradient(135deg, #e6f0ff 0%, #f5f7fb 45%, #f7f5ff 100%);
+      --ms-card: #ffffffcc;
+      --ms-primary: #5b7cfa;      /* calming indigo */
+      --ms-accent: #3ecf8e;       /* soft green */
+      --ms-soft: #a7b6ff;         /* lighter indigo */
+      --ms-text: #263238;         /* deep slate */
+      --ms-muted: #6c7a89;
+      --ms-badge: #eef2ff;
+    }
+
+    body{ background: var(--ms-bg); min-height: 100vh; color: var(--ms-text); }
+
+    .app-wrapper{ max-width: 1100px; }
+
+    .brand{
+      font-weight: 800; letter-spacing: .3px;
+      background: linear-gradient(120deg, var(--ms-primary), #8a9bff);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+
+    .glass-card{
+      background: var(--ms-card);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(91,124,250,.15);
+      box-shadow: 0 12px 40px rgba(38,50,56,.08);
+    }
+
+    .chat-area{ height: 58vh; overflow-y: auto; padding: .75rem; }
+    .msg{ max-width: 80%; padding: .75rem .9rem; border-radius: 14px; margin:.35rem 0; }
+    .msg-user{ margin-left:auto; background:#e8f1ff; border:1px solid #d7e4ff; }
+    .msg-bot{ margin-right:auto; background:#f5f7ff; border:1px solid #eceeff; }
+
+    .thinking{ opacity:.6; font-style: italic; }
+
+    .badge-emotion{ background: var(--ms-badge); color: #364152; border: 1px solid #e3e8ff; }
+    .video-card a{ word-break: break-word; }
+
+    .pill{
+      display:inline-flex; align-items:center; gap:.35rem; padding:.35rem .65rem;
+      border-radius: 999px; font-size:.8rem; border:1px solid #e9ecff; background:#f6f7ff;
+    }
+
+    .mic-btn.recording{ animation: pulse 1.2s ease-in-out infinite; }
+    @keyframes pulse{ 0%{box-shadow:0 0 0 0 rgba(91,124,250,.4)} 70%{box-shadow:0 0 0 14px rgba(91,124,250,0)} 100%{box-shadow:0 0 0 0 rgba(91,124,250,0)} }
+
+    .footer-note{ font-size:.85rem; color: var(--ms-muted); }
+  </style>
+</head>
+<body>
+  <div class="container py-4 app-wrapper">
+
+    <!-- Header -->
+    <div class="d-flex align-items-center justify-content-between mb-3">
+      <div class="d-flex align-items-center gap-3">
+        <div class="rounded-circle bg-white border d-flex align-items-center justify-content-center" style="width:42px;height:42px;">
+          <i class="bi bi-flower2 text-primary"></i>
+        </div>
+        <div>
+          <h1 class="h4 brand mb-0">MindSpace</h1>
+          <div class="small text-muted">gentle, practical support • last 5 messages remembered</div>
+        </div>
+      </div>
+      <div class="d-flex align-items-center gap-2">
+        <span class="pill"><i class="bi bi-shield-check"></i> non‑clinical</span>
+        <span class="pill"><i class="bi bi-soundwave"></i> voice friendly</span>
+      </div>
+    </div>
+
+    <!-- Main card -->
+    <div class="glass-card rounded-4 p-3 p-md-4">
+      <div class="row g-4">
+        <div class="col-lg-8">
+          <!-- Chat window -->
+          <div id="chat" class="chat-area rounded-4 bg-white border"></div>
+
+          <!-- Composer -->
+          <div class="mt-3 d-flex align-items-end gap-2">
+            <div class="flex-grow-1">
+              <label class="form-label small text-muted mb-1">What's on your mind?</label>
+              <textarea id="userInput" class="form-control" rows="2" placeholder="Tell me a bit about what you're feeling…"></textarea>
+            </div>
+            <div class="d-flex flex-column gap-2 align-items-center">
+              <button id="micBtn" class="btn btn-outline-primary rounded-circle mic-btn" title="Speak" style="width:48px;height:48px;">
+                <i class="bi bi-mic"></i>
+              </button>
+              <button id="sendBtn" class="btn btn-primary rounded-3 px-3"><i class="bi bi-send"></i></button>
+            </div>
+          </div>
+
+          <div class="d-flex justify-content-between mt-2">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="toggleTTS" checked>
+              <label class="form-check-label" for="toggleTTS">Read responses aloud</label>
+            </div>
+            <div class="text-muted small">Press <kbd>Ctrl</kbd>+<kbd>Enter</kbd> to send</div>
+          </div>
+        </div>
+
+        <!-- Side panel -->
+        <div class="col-lg-4">
+          <div class="p-3 bg-white border rounded-4 h-100">
+            <h6 class="mb-3">Session</h6>
+            <div class="mb-3 small text-muted">MindSpace may suggest a short activity video when it clearly helps.</div>
+
+            <div class="mb-3">
+              <label class="form-label">Options</label>
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="optVideos" checked>
+                <label class="form-check-label" for="optVideos">Allow video recommendations</label>
+              </div>
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="optHints" checked>
+                <label class="form-check-label" for="optHints">Show consumption hints</label>
+              </div>
+            </div>
+
+            <div class="border-top pt-3">
+              <h6 class="mb-2">Safety</h6>
+              <div class="footer-note">
+                MindSpace is not a substitute for professional help. If you’re in crisis or thinking about self‑harm, please contact local emergency services or reach out to a trusted person.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="text-center mt-3 footer-note">v0.1 • © MindSpace</div>
+  </div>
+
+  <!-- Bootstrap JS -->
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+
+  <script>
+    const chatEl = document.getElementById('chat');
+    const inputEl = document.getElementById('userInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const micBtn = document.getElementById('micBtn');
+    const toggleTTS = document.getElementById('toggleTTS');
+    const optVideos = document.getElementById('optVideos');
+    const optHints = document.getElementById('optHints');
+
+    // --- Chat helpers ---
+    function addUserMessage(text){
+      const el = document.createElement('div');
+      el.className = 'msg msg-user';
+      el.innerHTML = `<div class="small text-muted mb-1">You</div>${escapeHtml(text)}`;
+      chatEl.appendChild(el);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    function addBotThinking(){
+      const el = document.createElement('div');
+      el.className = 'msg msg-bot thinking';
+      el.id = 'thinking';
+      el.innerHTML = `<i class="bi bi-stars"></i> Thinking…`;
+      chatEl.appendChild(el);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    function replaceBotMessage({strategy, emotions, video}){
+      const think = document.getElementById('thinking');
+      if(think) think.remove();
+
+      const wrap = document.createElement('div');
+      wrap.className = 'msg msg-bot';
+
+      // Emotions as badges
+      const emBadges = (emotions||[]).map(e => `<span class="badge rounded-pill badge-emotion me-1">${escapeHtml(e)}</span>`).join('');
+
+      // Strategy text
+      const strategyHtml = `<p class="mb-2">${linkify(strategy)}</p>`;
+
+      // Optional video card
+      let videoHtml = '';
+      if (video && optVideos.checked) {
+        const mins = Math.floor((video.duration_sec||0)/60);
+        const secs = (video.duration_sec||0)%60;
+        const hint = optHints.checked ? `<div class="small text-muted mt-2"><i class="bi bi-lightbulb"></i> ${escapeHtml(video.how_to_consume||'')}</div>` : '';
+        videoHtml = `
+          <div class="video-card border rounded-3 p-3 mt-2 bg-white">
+            <div class="d-flex align-items-start justify-content-between">
+              <div>
+                <div class="fw-semibold">${escapeHtml(video.title||'Activity video')}</div>
+                <div class="small text-muted">${escapeHtml(video.channel||'YouTube')} • ${mins}m ${secs}s</div>
+              </div>
+              <a class="btn btn-sm btn-outline-primary" target="_blank" href="${video.url}"><i class="bi bi-box-arrow-up-right"></i> Open</a>
+            </div>
+            ${hint}
+          </div>`;
+      }
+
+      // TTS button
+      const ttsBtn = `<button class="btn btn-sm btn-outline-secondary ms-2" id="ttsPlay"><i class="bi bi-volume-up"></i></button>`;
+
+      wrap.innerHTML = `
+        <div class="d-flex align-items-center mb-2">
+          <div class="fw-semibold me-2">MindSpace</div>
+          <div>${emBadges}</div>
+          <div class="ms-auto d-flex align-items-center">${ttsBtn}</div>
+        </div>
+        ${strategyHtml}
+        ${videoHtml}
+      `;
+
+      chatEl.appendChild(wrap);
+      chatEl.scrollTop = chatEl.scrollHeight;
+
+      // Hook TTS
+      const btn = wrap.querySelector('#ttsPlay');
+      if(btn){
+        btn.addEventListener('click', ()=> speak(strategy));
+      }
+
+      // Auto TTS if enabled
+      if (toggleTTS.checked) speak(strategy + (video ? ' I also shared a short video with steps to follow.' : ''));
+    }
+
+    // --- Send logic ---
+    async function sendMessage(){
+      const text = inputEl.value.trim();
+      if(!text) return;
+      addUserMessage(text);
+      inputEl.value='';
+      addBotThinking();
+
+      try{
+        // IMPORTANT: update this URL to your backend endpoint
+        const res = await fetch('/analyze', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ text, allowVideos: optVideos.checked })
+        });
+        if(!res.ok) throw new Error('Network error');
+        const data = await res.json();
+        // expected: { emotions: string[], strategy: string, video?: { title, url, channel, duration_sec, how_to_consume } }
+        replaceBotMessage({ strategy: data.strategy || 'I’m here with you.', emotions: data.emotions || [], video: data.video || null });
+      }catch(err){
+        replaceBotMessage({ strategy: 'I’m having trouble reaching the service right now. Let’s try again in a moment.', emotions: ['neutral'] });
+      }
+    }
+
+    sendBtn.addEventListener('click', sendMessage);
+    inputEl.addEventListener('keydown', (e)=>{ if(e.key==='Enter' && (e.ctrlKey||e.metaKey)) sendMessage(); });
+
+    // --- Simple browser Speech-to-Text (optional) ---
+    let recognizing = false;
+    let recognition;
+    if ('webkitSpeechRecognition' in window) {
+      recognition = new webkitSpeechRecognition();
+      recognition.lang = 'en-US';
+      recognition.interimResults = true;
+      recognition.continuous = false;
+      recognition.onstart = () => { recognizing = true; micBtn.classList.add('recording'); };
+      recognition.onerror = () => { recognizing = false; micBtn.classList.remove('recording'); };
+      recognition.onend = () => { recognizing = false; micBtn.classList.remove('recording'); };
+      recognition.onresult = (event) => {
+        let final = '';
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) final += transcript;
+          else inputEl.value = transcript; // live preview
+        }
+        inputEl.value = (inputEl.value + ' ' + final).trim();
+      };
+    }
+
+    micBtn.addEventListener('click', ()=>{
+      if(!recognition){
+        // Fallback: focus input
+        inputEl.focus();
+        return;
+      }
+      if(recognizing){ recognition.stop(); }
+      else{ recognition.start(); }
+    });
+
+    // --- TTS via SpeechSynthesis ---
+    function speak(text){
+      try{
+        if(!('speechSynthesis' in window)) return;
+        window.speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        u.rate = 1; u.pitch = 1; u.volume = 1;
+        window.speechSynthesis.speak(u);
+      }catch(e){ /* ignore */ }
+    }
+
+    // --- Utils ---
+    function escapeHtml(str){
+      return (str||'').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[s]));
+    }
+    function linkify(text){
+      const urlRegex = /(https?:\/\/[^\s]+)/g;
+      return escapeHtml(text).replace(urlRegex, (url)=>`<a href="${url}" target="_blank">${url}</a>`);
+    }
+
+    // Greet
+    (function greet(){
+      const el = document.createElement('div');
+      el.className = 'msg msg-bot';
+      el.innerHTML = `<div class="fw-semibold mb-1">MindSpace</div>
+      <p class="mb-2">Hi, I’m here with you. Share what’s on your mind, or tap the <i class='bi bi-mic'></i> to speak.</p>`;
+      chatEl.appendChild(el);
+    })();
+  </script>
+</body>
+</html>

@@ -3,14 +3,17 @@ import os
 import re
 import requests
 import chromadb
-from transformers import pipeline
 import google.generativeai as genai
 from dotenv import load_dotenv
-from voice_input import get_voice_input
+# voice_input is still available if you later add a CLI mode
+from voice_input import get_voice_input  # optional; not used in web mode
 from gtts import gTTS
 from pydub import AudioSegment
 from pydub.playback import play
 from google.api_core.exceptions import ResourceExhausted, NotFound, PermissionDenied, FailedPrecondition
+
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 
 # ---------- Load Environment Variables ----------
 load_dotenv()
@@ -51,7 +54,7 @@ def _pick_model_name():
     """Return a stable, non-experimental model name available to the key/project."""
     try:
         models = list(genai.list_models())
-    except Exception as e:
+    except Exception:
         # If listing fails, try known stable IDs directly (API accepts either short id or 'models/<id>')
         return "models/gemini-1.5-flash-002"
 
@@ -94,7 +97,7 @@ def _swap_to_next_model():
     for c in candidates:
         if not _is_experimental(c) and c not in seen:
             seen.add(c); cleaned.append(c)
-    # If list_models() returns others we can merge them
+    # Merge any other listable, usable models
     try:
         lm = [m.name for m in genai.list_models() if _supports_generate(m) and not _is_experimental(m.name)]
         for name in lm:
@@ -136,15 +139,22 @@ def safe_generate(prompt: str, retries: int = 3):
             # Non-retryable / unexpected
             last_err = e
             break
-    # If all attempts failed, surface a clear message (won't crash your app loop)
+    # If all attempts failed, surface a clear message (won't crash your app)
     return ("I'm having trouble generating a response right now. "
             "Let's try again in a moment, or rephrase your concern briefly.")
 
-# ---------- Emotion Detection ----------
-sentiment_analyzer = pipeline(
-    "sentiment-analysis",
-    model="j-hartmann/emotion-english-distilroberta-base"
-)
+# ---------- Emotion Detection (LAZY-LOADED) ----------
+# Avoid importing transformers at startup (slow on Windows).
+_sentiment_pipe = None
+def get_sentiment_analyzer():
+    global _sentiment_pipe
+    if _sentiment_pipe is None:
+        from transformers import pipeline as hf_pipeline
+        _sentiment_pipe = hf_pipeline(
+            "sentiment-analysis",
+            model="j-hartmann/emotion-english-distilroberta-base"
+        )
+    return _sentiment_pipe
 
 # ---------- Conversation Memory (short-term session) ----------
 conversation_history = []
@@ -402,6 +412,9 @@ except Exception:
 
 # ---------- Main Analysis ----------
 def analyze_journal_entry(entry_text: str, user_id: str = "default_user"):
+    # LAZY load emotion analyzer here
+    sentiment_analyzer = get_sentiment_analyzer()
+
     emotions_result = sentiment_analyzer(entry_text)
     emotions = [e["label"] for e in emotions_result]
     emotions_str = ", ".join(emotions)
@@ -437,47 +450,37 @@ def analyze_journal_entry(entry_text: str, user_id: str = "default_user"):
     )
     return emotions, strategy, video
 
-# ---------- Interactive Run ----------
+# ---------- Flask Web Server ----------
+# Serve files from ./frontend (where your index.html lives)
+app = Flask(__name__, static_folder="frontend", static_url_path="")
+CORS(app)
+
+@app.get("/")
+def serve_index():
+    # Serves frontend/index.html
+    return send_from_directory("frontend", "index.html")
+
+@app.post("/analyze")
+def analyze_endpoint():
+    data = request.get_json(force=True) or {}
+    text = (data.get("text") or "").strip()
+    allow_videos = bool(data.get("allowVideos", True))
+
+    if not text:
+        return jsonify({"emotions": [], "strategy": "Could you share a bit more?", "video": None}), 200
+
+    emotions, strategy, video = analyze_journal_entry(text)
+
+    if not allow_videos:
+        video = None
+
+    resp = {
+        "emotions": emotions,
+        "strategy": strategy,
+        "video": video  # either dict or None
+    }
+    return jsonify(resp), 200
+
 if __name__ == "__main__":
-    print("Welcome to MindSpace 🌱 (type 'exit' anytime to quit)\n")
-    print("Choose input method:\n1. Keyboard\n2. Voice")
-    choice = input("Enter choice (1/2): ")
-
-    voice_mode = (choice == "2")
-
-    while True:
-        if voice_mode:
-            entry = get_voice_input(duration=6)
-            if not entry:
-                print("Voice input failed, switching to keyboard.")
-                entry = input("What's on your mind? ")
-                voice_mode = False
-        else:
-            entry = input("\nWhat's on your mind? ")
-
-        if not entry:
-            continue  # Skip empty input safely
-
-        if entry.lower() in ["exit", "quit", "bye"]:
-            print("Goodbye 👋 Stay well!")
-            break
-
-        emotions, strategy, video = analyze_journal_entry(entry)
-        print("\n--- MindSpace Response ---")
-        print("Detected Emotions:", emotions)
-        print("Suggested Coping Strategy:", strategy)
-
-        if video:
-            mins = video["duration_sec"] // 60
-            secs = video["duration_sec"] % 60
-            print("\nRecommended Activity Video:")
-            print(f"- {video['title']} ({mins}m {secs}s) — {video['channel']}")
-            print(f"- Link: {video['url']}")
-            print(f"- How to use: {video['how_to_consume']}")
-
-        # If voice input was used, auto-speak the output
-        if voice_mode:
-            spoken = strategy
-            if video:
-                spoken += " Also, I shared a short video—follow the steps as guided."
-            speak_text(spoken)
+    print("Starting MindSpace web server at http://localhost:5000")
+    app.run(host="127.0.0.1", port=5000, debug=False)
