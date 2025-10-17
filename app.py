@@ -1,24 +1,144 @@
 import time
+import os
+import re
+import requests
 import chromadb
 from transformers import pipeline
 import google.generativeai as genai
-import os
 from dotenv import load_dotenv
-from voice_input import get_voice_input   
+from voice_input import get_voice_input
 from gtts import gTTS
 from pydub import AudioSegment
 from pydub.playback import play
+from google.api_core.exceptions import ResourceExhausted, NotFound, PermissionDenied, FailedPrecondition
 
 # ---------- Load Environment Variables ----------
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")  # optional; agentic tool works only if provided
 
 if not api_key:
     raise ValueError("GEMINI_API_KEY not found in .env file")
 
 # ---------- Configure Gemini ----------
 genai.configure(api_key=api_key)
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+
+# Prefer stable 1.5 models; explicitly avoid experimental and 2.5 for now
+PREFERRED_SUBSTRINGS = [
+    "1.5-flash-002",
+    "1.5-flash",
+    "1.5-flash-8b",
+    "1.0-pro",           # wide availability on older accounts
+    "pro"                # last resort (but NOT experimental)
+]
+
+def _is_experimental(name: str) -> bool:
+    n = name.lower()
+    return ("exp" in n) or ("experimental" in n) or ("2.5" in n)
+
+def _supports_generate(m) -> bool:
+    methods = getattr(m, "supported_generation_methods", None) or []
+    return "generateContent" in methods
+
+def _rank_model_name(name: str) -> int:
+    name_l = name.lower()
+    for i, sub in enumerate(PREFERRED_SUBSTRINGS):
+        if sub in name_l:
+            return i
+    return len(PREFERRED_SUBSTRINGS) + 1
+
+def _pick_model_name():
+    """Return a stable, non-experimental model name available to the key/project."""
+    try:
+        models = list(genai.list_models())
+    except Exception as e:
+        # If listing fails, try known stable IDs directly (API accepts either short id or 'models/<id>')
+        return "models/gemini-1.5-flash-002"
+
+    usable = []
+    for m in models:
+        name = getattr(m, "name", "")
+        if not name:
+            continue
+        if _is_experimental(name):
+            continue
+        if not _supports_generate(m):
+            continue
+        usable.append(name)
+
+    if not usable:
+        # Hard fallbacks
+        return "models/gemini-1.5-flash-002"
+
+    usable.sort(key=_rank_model_name)
+    return usable[0]
+
+# Initialize global model (will be swapped if we hit 429/404)
+_CURRENT_MODEL_NAME = _pick_model_name()
+gemini_model = genai.GenerativeModel(_CURRENT_MODEL_NAME)
+
+def _swap_to_next_model():
+    """Pick the next preferred model different from current and rebuild gemini_model."""
+    global _CURRENT_MODEL_NAME, gemini_model
+    # Make a preference-ordered list of candidates
+    candidates = [
+        "models/gemini-1.5-flash-002",
+        "models/gemini-1.5-flash",
+        "models/gemini-1.5-flash-8b",
+        "models/gemini-1.0-pro",
+        "models/gemini-pro",
+    ]
+    # Ensure uniqueness and drop experimental/2.5
+    seen = set()
+    cleaned = []
+    for c in candidates:
+        if not _is_experimental(c) and c not in seen:
+            seen.add(c); cleaned.append(c)
+    # If list_models() returns others we can merge them
+    try:
+        lm = [m.name for m in genai.list_models() if _supports_generate(m) and not _is_experimental(m.name)]
+        for name in lm:
+            if name not in seen:
+                seen.add(name); cleaned.append(name)
+    except Exception:
+        pass
+
+    # rotate to the next after current
+    if _CURRENT_MODEL_NAME in cleaned:
+        idx = cleaned.index(_CURRENT_MODEL_NAME)
+        next_idx = (idx + 1) % len(cleaned)
+    else:
+        next_idx = 0
+
+    new_name = cleaned[next_idx]
+    _CURRENT_MODEL_NAME = new_name
+    gemini_model = genai.GenerativeModel(new_name)
+    return new_name
+
+def safe_generate(prompt: str, retries: int = 3):
+    """
+    Generate with automatic handling of:
+    - Quota/Rate (429 ResourceExhausted): swap to another stable model and retry.
+    - NotFound/Permission issues: swap models.
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            resp = gemini_model.generate_content(prompt)
+            return resp.text
+        except (ResourceExhausted, NotFound, PermissionDenied, FailedPrecondition) as e:
+            last_err = e
+            # Swap model and retry
+            _swap_to_next_model()
+            # brief jitter to respect any retry-after header behaviour
+            time.sleep(0.6 + 0.2 * attempt)
+        except Exception as e:
+            # Non-retryable / unexpected
+            last_err = e
+            break
+    # If all attempts failed, surface a clear message (won't crash your app loop)
+    return ("I'm having trouble generating a response right now. "
+            "Let's try again in a moment, or rephrase your concern briefly.")
 
 # ---------- Emotion Detection ----------
 sentiment_analyzer = pipeline(
@@ -97,19 +217,169 @@ def build_prompt(entry: str, emotions: str, repeated_emotion: str = None) -> str
 # ---------- Function to generate coping strategy ----------
 def suggest_coping_strategy(entry: str, emotions: str, repeated_emotion: str = None) -> str:
     prompt = build_prompt(entry, emotions, repeated_emotion)
-    response = gemini_model.generate_content(prompt)
-    generated = response.text.strip()
+    generated = safe_generate(prompt) or ""
+    generated = generated.strip()
 
     sentences = generated.split(". ")
     # Expand allowed length if repeated emotion
     max_sentences = 5 if repeated_emotion else 4
     cleaned = ". ".join(sentences[:max_sentences]).strip()
-    if not cleaned.endswith("."):
+    if cleaned and not cleaned.endswith("."):
         cleaned += "."
+    if not cleaned:
+        cleaned = "Let’s take this step by step. Start with one small, doable action toward relief."
 
     # Save conversation context
     conversation_history.append(f"User: {entry}\nAssistant: {cleaned}")
     return cleaned
+
+# ---------- Agentic Video Tool ----------
+VIDEO_QUERY_PATTERNS = [
+    (r"\b(breath|breathe|breathing|panic|anxiety)\b", "5 minute guided breathing for anxiety"),
+    (r"\b(grounding|5-4-3-2-1)\b", "5-4-3-2-1 grounding exercise guided"),
+    (r"\b(mindful|mindfulness|meditat)\b", "10 minute guided mindfulness meditation for stress"),
+    (r"\b(progressive muscle|pmr|tense and release)\b", "progressive muscle relaxation guided"),
+    (r"\b(sleep|insomnia|can't sleep|cant sleep)\b", "sleep relaxation body scan 10 minutes"),
+    (r"\b(journal|journaling)\b", "guided journaling for anxiety prompt"),
+    (r"\b(cbt|cognitive|thought record|reframe)\b", "CBT thought record tutorial step by step"),
+    (r"\b(worry|overthink|rumination)\b", "cognitive defusion exercise guided"),
+    (r"\b(study|exam|test|focus|concentrat)\b", "pomodoro timer study with me 25 minute"),
+    (r"\b(work|burnout|break|office|deadline)\b", "2 minute desk breathing box breathing"),
+]
+
+def _first_match(text: str, patterns):
+    t = (text or "").lower()
+    for pat, query in patterns:
+        if re.search(pat, t):
+            return query
+    return None
+
+def _clean_text(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def _yt_search(query: str, max_results: int = 5):
+    """YouTube Data API v3: search + get durations. Returns list of dicts. Safe no-op if no API key."""
+    if not YOUTUBE_API_KEY:
+        return []
+    try:
+        # 1) search
+        search_r = requests.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "maxResults": max_results,
+                "safeSearch": "strict",
+                "videoEmbeddable": "true",
+                "key": YOUTUBE_API_KEY
+            },
+            timeout=8,
+        )
+        search_r.raise_for_status()
+        items = search_r.json().get("items", [])
+        if not items:
+            return []
+
+        video_ids = ",".join([it["id"]["videoId"] for it in items])
+
+        # 2) fetch durations/metrics
+        vid_r = requests.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={
+                "part": "contentDetails,statistics",
+                "id": video_ids,
+                "key": YOUTUBE_API_KEY
+            },
+            timeout=8,
+        )
+        vid_r.raise_for_status()
+        meta_by_id = {it["id"]: it for it in vid_r.json().get("items", [])}
+
+        def parse_iso8601_duration(d):
+            # PT#H#M#S, PT#M#S, PT#S
+            hours = minutes = seconds = 0
+            m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", d or "")
+            if m:
+                hours = int(m.group(1) or 0)
+                minutes = int(m.group(2) or 0)
+                seconds = int(m.group(3) or 0)
+            return hours * 3600 + minutes * 60 + seconds
+
+        results = []
+        for it in items:
+            vid = it["id"]["videoId"]
+            snip = it["snippet"]
+            meta = meta_by_id.get(vid, {})
+            dur_iso = (meta.get("contentDetails") or {}).get("duration", "PT0S")
+            dur_sec = parse_iso8601_duration(dur_iso)
+            views = int((meta.get("statistics") or {}).get("viewCount", 0))
+            results.append({
+                "video_id": vid,
+                "title": _clean_text(snip.get("title", "")),
+                "channel": snip.get("channelTitle", ""),
+                "duration_sec": dur_sec,
+                "views": views,
+                "url": f"https://www.youtube.com/watch?v={vid}",
+            })
+        return results
+    except Exception:
+        return []
+
+def _rank_videos(videos, target_min=180, target_max=1200):
+    """Prefer short-to-medium, higher views."""
+    def score(v):
+        dur = v.get("duration_sec", 0) or 0
+        in_band = target_min <= dur <= target_max
+        mid = (target_min + target_max) / 2
+        length_penalty = abs(dur - mid)
+        return (1000000 if in_band else 0) + v.get("views", 0) - length_penalty
+    return sorted(videos, key=score, reverse=True)
+
+def maybe_recommend_video(user_text: str, strategy_text: str):
+    """
+    Decide whether to fetch a video.
+    - Trigger if user_text or strategy mentions a known activity.
+    - Return dict with video info OR None.
+    """
+    query = _first_match(user_text, VIDEO_QUERY_PATTERNS) or _first_match(strategy_text, VIDEO_QUERY_PATTERNS)
+    if not query:
+        return None
+
+    candidates = _yt_search(query, max_results=6)
+    if not candidates:
+        return None
+
+    ranked = _rank_videos(candidates)
+    top = ranked[0]
+
+    # final gate: avoid too short (<60s) or too long (>40m)
+    if top["duration_sec"] < 60 or top["duration_sec"] > 2400:
+        return None
+
+    # consumption guidance tailored to the query
+    guide = "Play the video in a quiet spot. Follow along in real time and pause if needed."
+    q = query.lower()
+    if "breath" in q or "box" in q:
+        guide = "Sit upright, shoulders relaxed. Inhale 4, hold 4, exhale 4 (or as guided). Follow the instructor’s pacing."
+    elif "grounding" in q:
+        guide = "Follow 5-4-3-2-1: name 5 things you see, 4 touch, 3 hear, 2 smell, 1 taste. Let the guide pace you."
+    elif "mindful" in q or "meditation" in q or "body scan" in q:
+        guide = "Keep eyes soft or closed. If your mind wanders, gently return to the breath/body without judgment."
+    elif "progressive muscle" in q:
+        guide = "Follow ‘tense then release’ instructions. Don’t strain; aim for gentle tension and full release."
+    elif "cbt" in q or "thought record" in q:
+        guide = "Keep a notebook ready. Pause to write each step: situation, thoughts, evidence for/against, reframe."
+    elif "study" in q or "pomodoro" in q:
+        guide = "Use the video as a 25-minute focus block. Before starting, list 1–2 concrete tasks to finish."
+
+    return {
+        "title": top["title"],
+        "url": top["url"],
+        "channel": top["channel"],
+        "duration_sec": top["duration_sec"],
+        "how_to_consume": guide
+    }
 
 # ---------- Function: Speak text out loud ----------
 def speak_text(text: str):
@@ -121,7 +391,14 @@ def speak_text(text: str):
 
 # ---------- ChromaDB Setup ----------
 chroma_client = chromadb.Client()
-journal_collection = chroma_client.create_collection(name="mindspace_journals")
+try:
+    journal_collection = chroma_client.get_or_create_collection(name="mindspace_journals")
+except Exception:
+    # fallback for older clients
+    try:
+        journal_collection = chroma_client.create_collection(name="mindspace_journals")
+    except Exception:
+        journal_collection = chroma_client.get_collection(name="mindspace_journals")
 
 # ---------- Main Analysis ----------
 def analyze_journal_entry(entry_text: str, user_id: str = "default_user"):
@@ -137,16 +414,28 @@ def analyze_journal_entry(entry_text: str, user_id: str = "default_user"):
 
     strategy = suggest_coping_strategy(entry_text, emotions_str, repeated_emotion)
 
+    # Agentic step: optionally attach a video recommendation
+    video = maybe_recommend_video(entry_text, strategy)
+
+    metadata = {
+        "user": user_id,
+        "strategy": strategy,
+        "emotions": emotions_str
+    }
+    if video:
+        metadata.update({
+            "video_title": video["title"],
+            "video_url": video["url"],
+            "video_channel": video["channel"],
+            "video_duration_sec": video["duration_sec"]
+        })
+
     journal_collection.add(
         documents=[entry_text],
-        metadatas=[{
-            "user": user_id,
-            "strategy": strategy,
-            "emotions": emotions_str
-        }],
+        metadatas=[metadata],
         ids=[f"{user_id}_{int(time.time()*1000)}"]
     )
-    return emotions, strategy
+    return emotions, strategy, video
 
 # ---------- Interactive Run ----------
 if __name__ == "__main__":
@@ -158,9 +447,7 @@ if __name__ == "__main__":
 
     while True:
         if voice_mode:
-            # print("\n🎙️ Recording... Speak now")
             entry = get_voice_input(duration=6)
-            # print("Recording finished")
             if not entry:
                 print("Voice input failed, switching to keyboard.")
                 entry = input("What's on your mind? ")
@@ -175,11 +462,22 @@ if __name__ == "__main__":
             print("Goodbye 👋 Stay well!")
             break
 
-        emotions, strategy = analyze_journal_entry(entry)
+        emotions, strategy, video = analyze_journal_entry(entry)
         print("\n--- MindSpace Response ---")
         print("Detected Emotions:", emotions)
         print("Suggested Coping Strategy:", strategy)
 
+        if video:
+            mins = video["duration_sec"] // 60
+            secs = video["duration_sec"] % 60
+            print("\nRecommended Activity Video:")
+            print(f"- {video['title']} ({mins}m {secs}s) — {video['channel']}")
+            print(f"- Link: {video['url']}")
+            print(f"- How to use: {video['how_to_consume']}")
+
         # If voice input was used, auto-speak the output
         if voice_mode:
-            speak_text(strategy)
+            spoken = strategy
+            if video:
+                spoken += " Also, I shared a short video—follow the steps as guided."
+            speak_text(spoken)
